@@ -1,0 +1,4 @@
+# Local build artifacts
+/*.elf
+/*.bin
+/*.hex
