@@ -1,46 +1,130 @@
-// +build mimxrt1062
+//go:build mimxrt1062
 
 package target
 
 import (
 	"device/nxp"
+	"errors"
 	"machine"
+
+	"github.com/ardnew/teensy40-matrix/hub75"
 )
 
-var flexIOPin = map[*nxp.FlexIO]map[machine.Pin]uint8{
-	&nxp.FlexIO1: {
-		machine.PD0: 0, machine.PD1: 1, machine.PD2: 2, machine.PD3: 3,
-		machine.PD4: 4, machine.PD5: 5, machine.PD6: 6, machine.PD7: 7,
-		machine.PD8: 8, machine.PD9: 9, machine.PD10: 10, machine.PD11: 11,
-		machine.PD26: 12, machine.PD27: 13, machine.PD28: 14, machine.PD29: 15,
-	},
-	&nxp.FlexIO2: {
-		machine.PB0: 0, machine.PB1: 1, machine.PB2: 2, machine.PB3: 3,
-		machine.PB4: 4, machine.PB5: 5, machine.PB6: 6, machine.PB7: 7,
-		machine.PB8: 8, machine.PB9: 9, machine.PB10: 10, machine.PB11: 11,
-		machine.PB12: 12, machine.PB13: 13, machine.PB14: 14, machine.PB15: 15,
-		machine.PB16: 16, machine.PB17: 17, machine.PB18: 18, machine.PB19: 19,
-		machine.PB20: 20, machine.PB21: 21, machine.PB22: 22, machine.PB23: 23,
-		machine.PB24: 24, machine.PB25: 25, machine.PB26: 26, machine.PB27: 27,
-		machine.PB28: 28, machine.PB29: 29, machine.PB30: 30, machine.PB31: 31,
-	},
-	&nxp.FlexIO3: {
-		machine.PA16: 0, machine.PA17: 1, machine.PA18: 2, machine.PA19: 3,
-		machine.PA20: 4, machine.PA21: 5, machine.PA22: 6, machine.PA23: 7,
-		machine.PA24: 8, machine.PA25: 9, machine.PA26: 10, machine.PA27: 11,
-		machine.PA28: 12, machine.PA29: 13, machine.PA30: 14, machine.PA31: 15,
-		machine.PB16: 16, machine.PB17: 17, machine.PB18: 18, machine.PB19: 19,
-		machine.PB20: 20, machine.PB21: 21, machine.PB22: 22, machine.PB23: 23,
-		machine.PB24: 24, machine.PB25: 25, machine.PB26: 26, machine.PB27: 27,
-		machine.PB28: 28, machine.PB29: 29, machine.PB30: 30, machine.PB31: 31,
-	},
+var ErrInvalidFlexPins = errors.New("invalid FlexIO pin configuration")
+
+var FlexIOHandle = &nxp.FlexIO2
+
+type Board struct {
+	flex *nxp.FlexIO
+	Pins Pins
 }
 
-func FlexIOPin(pin machine.Pin) (*nxp.FlexIO, uint8) {
-	for f, m := range flexIOPin {
-		if p, ok := m[pin]; ok {
-			return f, p
-		}
+type Pins struct {
+	hub75.Pins
+	flex flexPins
+}
+
+type flexPins struct {
+	// Signal pins
+	CLK uint8
+	// Color pins
+	R0 uint8
+	G0 uint8
+	B0 uint8
+	R1 uint8
+	G1 uint8
+	B1 uint8
+	// Address pins
+	A0 uint8
+	A1 uint8
+	A2 uint8
+	A3 uint8
+	A4 uint8
+}
+
+func (b *Board) Configure(pins hub75.Pins) error {
+
+	if err := b.Pins.Configure(b.flex, pins); err != nil {
+		return err
 	}
-	return nil, uint8(machine.NoPin)
+
+	b.flex = FlexIOHandle
+
+	// Enable FlexIO peripheral
+	b.flex.CTRL.Set(nxp.FLEXIO_CTRL_FLEXEN | nxp.FLEXIO_CTRL_FASTACC)
+
+	shiftCfg := nxp.FlexIOShifterConfig{}
+	b.flex.Configure(&b.flex.SHIFTCFG[0], shiftCfg)
+
+	return nil
+}
+
+func (p *Pins) Configure(bus *nxp.FlexIO, pins hub75.Pins) error {
+	p.Pins = pins
+
+	// Configure FlexIO pins
+	p.CLK.Configure(machine.PinConfig{Mode: machine.PinModeFlexIO})
+	p.R0.Configure(machine.PinConfig{Mode: machine.PinModeFlexIO})
+	p.G0.Configure(machine.PinConfig{Mode: machine.PinModeFlexIO})
+	p.B0.Configure(machine.PinConfig{Mode: machine.PinModeFlexIO})
+	p.R1.Configure(machine.PinConfig{Mode: machine.PinModeFlexIO})
+	p.G1.Configure(machine.PinConfig{Mode: machine.PinModeFlexIO})
+	p.B1.Configure(machine.PinConfig{Mode: machine.PinModeFlexIO})
+
+	p.flex.CLK = p.CLK.FlexIO(bus)
+	p.flex.R0 = p.R0.FlexIO(bus)
+	p.flex.G0 = p.G0.FlexIO(bus)
+	p.flex.B0 = p.B0.FlexIO(bus)
+	p.flex.R1 = p.R1.FlexIO(bus)
+	p.flex.G1 = p.G1.FlexIO(bus)
+	p.flex.B1 = p.B1.FlexIO(bus)
+
+	lo := min(p.flex.R0, min(p.flex.G0, min(p.flex.B0, min(p.flex.R1, min(p.flex.G1, p.flex.B1)))))
+	hi := max(p.flex.R0, max(p.flex.G0, max(p.flex.B0, max(p.flex.R1, max(p.flex.G1, p.flex.B1)))))
+
+	ob := 0
+	if hi < lo+16 {
+		ob = 1
+	}
+	lb := 0
+	if p.flex.CLK < lo {
+		lb = 1
+	}
+	hb := 0
+	if p.flex.CLK > hi {
+		hb = 1
+	}
+
+	if 0 != ob&(lb|hb) {
+		return ErrInvalidFlexPins
+	}
+
+	p.flex.R0 -= lo
+	p.flex.G0 -= lo
+	p.flex.B0 -= lo
+	p.flex.R1 -= lo
+	p.flex.G1 -= lo
+	p.flex.B1 -= lo
+
+	p.flex.A0 = p.A0.FlexIO(bus) - lo
+	p.flex.A1 = p.A1.FlexIO(bus) - lo
+	p.flex.A2 = p.A2.FlexIO(bus) - lo
+	p.flex.A3 = p.A3.FlexIO(bus) - lo
+	p.flex.A4 = p.A4.FlexIO(bus) - lo
+
+	return nil
+}
+
+func min(a, b uint8) uint8 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b uint8) uint8 {
+	if a > b {
+		return a
+	}
+	return b
 }
