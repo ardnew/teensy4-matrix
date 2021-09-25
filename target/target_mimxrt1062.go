@@ -8,6 +8,7 @@ import (
 	"machine"
 	"math/bits"
 	"runtime"
+	"unsafe"
 
 	"github.com/ardnew/teensy40-matrix/hub75"
 )
@@ -22,6 +23,10 @@ var FlexIOHandle = &nxp.FlexIO2
 type Board struct {
 	flex *nxp.FlexIO
 	Pins Pins
+
+	dmaUpdate *nxp.DMAChannel
+	dmaEnable *nxp.DMAChannel
+	dmaOutput *nxp.DMAChannel
 }
 
 type Pins struct {
@@ -50,6 +55,10 @@ type flexPins struct {
 	A2 nxp.FlexIOPin
 	A3 nxp.FlexIOPin
 	A4 nxp.FlexIOPin
+}
+
+type timerControl struct {
+	oen, per uint16
 }
 
 const (
@@ -101,6 +110,16 @@ const (
 	MaxTransferNanoseconds = (32*FlexIOClockDivider*1000)/480 + 200
 )
 
+//rowDataBuffer [dmaBufferBytesPerRow*dmaBufferNumRows/sizeof(uint32_t)]uint32
+
+//go:section .dmabuffer
+var enablerSourceByte uint8
+
+//go:section .dmabuffer
+var timerLUT [hub75.LatchesPerRow]timerControl
+
+// unsigned int rowAddressBuffer[dmaBufferNumRows];
+
 func NanosecondsToTicks(nano int64) uint32 {
 	return uint32(nano / NanosecondsPerTick)
 }
@@ -121,13 +140,17 @@ func MinBlockPeriodTicks(panel hub75.Panel) uint32 {
 	return NanosecondsToTicks(MinBlockPeriodNanoseconds(panel))
 }
 
-func TicksPerRow(panel hub75.Panel, refreshRate uint32) uint32 {
-	return TimerFrequency / refreshRate / panel.ScanMod()
+func TicksPerRow(panel hub75.Panel) uint32 {
+	return TimerFrequency / hub75.RefreshDepth / panel.ScanMod()
 }
 
-func MSBBlockTicks(panel hub75.Panel, refreshRate uint32) uint32 {
-	lpr := panel.LatchesPerRow(refreshRate)
-	return (TicksPerRow(panel, refreshRate) / 2) * (1 << lpr) / ((1 << lpr) - 1)
+func MSBBlockTicks(panel hub75.Panel) uint32 {
+	return (TicksPerRow(panel) / 2) *
+		(1 << hub75.LatchesPerRow) / ((1 << hub75.LatchesPerRow) - 1)
+}
+
+func BufferBytesPerRow(panel hub75.Panel) uint32 {
+	return hub75.LatchesPerRow * panel.PixelsPerLatch() * 2 // 2 bytes per pixel
 }
 
 func (b *Board) Configure(matrix hub75.Matrix) error {
@@ -242,6 +265,49 @@ func (b *Board) Configure(matrix hub75.Matrix) error {
 	pwm.MCTRL.SetBits((bit << nxp.PWM_MCTRL_LDOK_Pos) & nxp.PWM_MCTRL_LDOK_Msk)
 
 	pwm.SM[mod].DMAEN.SetBits(nxp.PWM_SM0DMAEN_VALDE)
+
+	var err error
+	if b.dmaUpdate, err = nxp.AllocDMA(); err != nil {
+		return err
+	}
+	if b.dmaEnable, err = nxp.AllocDMA(); err != nil {
+		return err
+	}
+	if b.dmaOutput, err = nxp.AllocDMA(); err != nil {
+		return err
+	}
+
+	b.dmaUpdate.Enable(false)
+	b.dmaEnable.Enable(false)
+	b.dmaOutput.Enable(false)
+
+	const (
+		minor = unsafe.Sizeof(timerControl{})
+		major = uintptr(hub75.LatchesPerRow)
+	)
+
+	srca := uintptr(unsafe.Pointer(&(timerLUT[0].oen)))
+	srco := unsafe.Sizeof(timerLUT[0].oen)
+	srcl := major * minor
+	dst1 := uintptr(unsafe.Pointer(&(pwm.SM[mod].VAL3)))
+	dst2 := uintptr(unsafe.Pointer(&(pwm.SM[mod].VAL1)))
+	dsto := dst2 - dst1
+	dstl := 2 * dsto
+	mino := dstl
+
+	b.dmaUpdate.TCD.SADDR.Set(uint32(srca))
+	b.dmaUpdate.TCD.SOFF.Set(uint16(srco))
+	b.dmaUpdate.TCD.ATTR.Set(0x0101) // 16-bit source, destination
+	b.dmaUpdate.TCD.NBYTES.Set((uint32(1) << 30) |
+		((uint32(mino) & 0xFFFFF) << 10) | (uint32(minor) & 0x3FF))
+	b.dmaUpdate.TCD.SLAST.Set(uint32(srcl))
+	b.dmaUpdate.TCD.DADDR.Set(uint32(dst1))
+	b.dmaUpdate.TCD.DOFF.Set(uint16(dsto))
+	b.dmaUpdate.TCD.DLAST.Set(uint32(dstl))
+	b.dmaUpdate.TCD.BITER.Set(uint16(major))
+	b.dmaUpdate.TCD.CITER.Set(uint16(major))
+	_, dmaTriggerPWMLAT := b.Pins.flex.LAT.DMAChannel()
+	b.dmaUpdate.SetHardwareTrigger(dmaTriggerPWMLAT)
 
 	return nil
 }

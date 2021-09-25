@@ -49,24 +49,24 @@ const (
 )
 
 const (
-	DefaultPanelWidth     = 32
+	DefaultPanelWidth = 32
+
+	RefreshDepth          = 24
 	ParallelColorChannels = 2
 	ColorChannelsPerPixel = 3 // red, green, and blue
+
+	// LatchesPerRow computes the color depth per pixel for a given refresh depth.
+	// For example, LatchesPerRow=8 when RefreshDepth=24, which corresponds to
+	// 24-bit TrueColor (8 bits per pixel).
+	LatchesPerRow = RefreshDepth / ColorChannelsPerPixel
 )
 
 // MinRefreshRate returns the minimum refresh rate of the receiver panel for a
 // given timer frequency and refresh depth.
 // The HUB75 panel cannot refresh slower than this due to PWM register overflow.
-func (p Panel) MinRefreshRate(timerFreq, refreshDepth uint32) uint32 {
-	lat := uint32(1) << p.LatchesPerRow(refreshDepth)
+func (p Panel) MinRefreshRate(timerFreq uint32) uint32 {
+	lat := uint32(1) << LatchesPerRow
 	return ((timerFreq / 0xFFFF * lat / (lat - 1) / (p.ScanMod()) / 2) + 1)
-}
-
-// LatchesPerRow computes the color depth per pixel for a given refresh depth.
-// For example, returns 8 when given a refresh depth of 24, which corresponds to
-// 24-bit TrueColor (8 bits per pixel).
-func (p Panel) LatchesPerRow(refreshDepth uint32) uint32 {
-	return refreshDepth / ColorChannelsPerPixel
 }
 
 func (p Panel) MultiRowRefresh() bool {
