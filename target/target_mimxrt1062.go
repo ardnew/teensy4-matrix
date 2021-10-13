@@ -8,25 +8,39 @@ import (
 	"machine"
 	"math/bits"
 	"runtime"
+	"runtime/volatile"
 	"unsafe"
 
+	"github.com/ardnew/teensy40-matrix/color"
 	"github.com/ardnew/teensy40-matrix/hub75"
+	"github.com/ardnew/teensy40-matrix/queue"
 )
 
 var (
 	ErrInvalidFlexIOPins  = errors.New("invalid FlexIO pin configuration")
 	ErrInvalidFlexPWMPins = errors.New("invalid FlexPWM pin configuration")
+
+	ErrMaxRefreshRate = errors.New("refresh rate greater than configuration maximum")
+	ErrMinRefreshRate = errors.New("refresh rate less than configuration minimum")
 )
 
 var FlexIOHandle = &nxp.FlexIO2
 
 type Board struct {
+	Panel []hub75.Panel
+	Pins  Pins
+
 	flex *nxp.FlexIO
-	Pins Pins
 
 	dmaUpdate *nxp.DMAChannel
 	dmaEnable *nxp.DMAChannel
 	dmaOutput *nxp.DMAChannel
+
+	ring     queue.Ring
+	underrun volatile.Register8
+	current  volatile.Register32
+
+	dim uint32
 }
 
 type Pins struct {
@@ -58,108 +72,139 @@ type flexPins struct {
 }
 
 type timerControl struct {
-	oen, per uint16
+	oen, per volatile.Register16
 }
 
+type rowBits struct {
+	px      [hub75.DefaultPanelWidth]uint16
+	address uint32
+	timer   timerControl
+}
+
+type rowPlane struct{ plane [hub75.LatchesPerRow]rowBits }
+
+type rgb color.Rgb48
+
+type frameBuffer [][]rgb
+
+// Buffer size constants
 const (
 	// Number of 32-bit FlexIO shifters to use for data buffering.
 	// Larger numbers decrease DMA usage.
 	// Known working: 1, 2, 3, 4
-	DataShifters = 4
+	DataShifters = 2
+
+	NumRowBuffers = 4
 
 	PixelsPerWord = 2
 	ShifterPixels = DataShifters * PixelsPerWord
+	// ShiftsPerLoad = DataShifters * PixelsPerWord
 
-	LatchTimerPrescale = 1 // if min refresh rate is too high, increase this value
-	TimerFrequency     = runtime.BUS_FREQ >> LatchTimerPrescale
-	NanosecondsPerTick = 1000000000 / TimerFrequency
-
-	// MSB_BLOCK_TICKS_ADJUSTMENT_INCREMENT =    10
-	// MSB_BLOCK_TICKS_ADJUSTMENT_INCREMENT = (TICKS_PER_ROW / 512)
-	// MIN_REFRESH_RATE                     = (((TimerFrequency) / 65535 * (1 << LATCHES_PER_ROW) / ((1 << LATCHES_PER_ROW) - 1) / (MATRIX_SCAN_MOD) / 2) + 1) // cannot refresh slower than this due to PWM register overflow
-	// MAX_REFRESH_RATE                     = ((TimerFrequency)/(MIN_BLOCK_PERIOD_TICKS)/(MATRIX_SCAN_MOD)/(LATCHES_PER_ROW) - 1)                              // cannot refresh faster than this due to output bandwidth
-
-	// ROW_CALCULATION_ISR_PRIORITY    = 240 // lowest priority for IMXRT1062
-	// ROW_SHIFT_COMPLETE_ISR_PRIORITY = 96  // one step above USB priority
-	// TIMER_REGISTERS_TO_UPDATE       = 2
-
-	// size of latch pulse - can be short for V4 shield which doesn't need to update ADDX lines during latch pulse
-	// 20 is minimum working value on DP5020B panel
-	// set to 100 for improved support with FM6126A panel
-	// don't exceed 150 to avoid interference between latch and data transfer
-	LatchPulseNanoseconds = 100
-	LatchPulseTicks       = LatchPulseNanoseconds / NanosecondsPerTick
-
-	// max delay from rising edge of latch pulse to falling edge of first pixel clock
-	// increase this value if DMA use is delaying clock
-	// Measured 220 ns delay at 600 MHz clock speed, 160 ns at 816 MHz. Slower speeds are not supported.
-	// Using larger delay for safety.
-	LatchDelayNanoseconds = 400
-
-	// Pixel clock frequency is generated using the 480 MHz PLL3 clock and a divide-by-n counter. Frequency is independent of CPU clock speed.
-	// Must increment divider value by 2 (division ratio is always even)
-	// Minimum tested working value is 20 (corresponding to 24 MHz clock frequency) on DP5020B panel
-	// Using value of 26 (corresponding to 18.462 MHz clock frequency) to improve stability and reduce glitching
-	// Larger values may be more stable, but will decrease maximum refresh rate
-	FlexIOClockDivider = 26
-
-	ShiftsPerReload = DataShifters * PixelsPerWord
-
-	// Amount of time required to transfer 32 pixels
-	// Adding 200 ns overhead time to improve stability
-	MaxTransferNanoseconds = (32*FlexIOClockDivider*1000)/480 + 200
+	// NumDMABufferRowBytes = hub75.LatchesPerRow * hub75.DefaultPanelWidth * 2
 )
 
-//rowDataBuffer [dmaBufferBytesPerRow*dmaBufferNumRows/sizeof(uint32_t)]uint32
+const (
+	RowShiftInterruptPriority       = 0x60
+	RowCalculationInterruptPriority = 0xF0
+)
+
+// Timing constants
+const (
+	LatchTimerPrescale = 1 // Increase this value if min refresh rate is too high
+	TimerFrequencyHz   = runtime.BUS_FREQ >> LatchTimerPrescale
+	NanosPerTick       = 1000000000 / TimerFrequencyHz
+
+	// MIN_REFRESH_RATE                     = (((TimerFrequencyHz) / 65535 * (1 << LATCHES_PER_ROW) / ((1 << LATCHES_PER_ROW) - 1) / (MATRIX_SCAN_MOD) / 2) + 1) // cannot refresh slower than this due to PWM register overflow
+	// MAX_REFRESH_RATE                     = ((TimerFrequencyHz)/(MIN_BLOCK_PERIOD_TICKS)/(MATRIX_SCAN_MOD)/(LATCHES_PER_ROW) - 1)                              // cannot refresh faster than this due to output bandwidth
+
+	// Size of latch pulse - can be short for V4 shield which doesn't need to
+	// update ADDX lines during latch pulse.
+	// 20 is minimum working value on DP5020B panel
+	// Set to 100 for improved support with FM6126A panel.
+	// Don't exceed 150 to avoid interference between latch and data transfer.
+	LatchPulseNanos = 100
+	LatchPulseTicks = LatchPulseNanos / NanosPerTick
+
+	// Max delay from falling edge of latch pulse to rising edge of first pixel
+	// clock.
+	// Increase this value if DMA use is delaying clock.
+	// Measured 220 ns delay at 600 MHz clock speed, 160 ns at 816 MHz. Slower
+	// speeds are not supported.
+	LatchClockDelayNanos = 400 // Using larger delay for safety.
+
+	// Pixel clock frequency is generated using the 480 MHz PLL3 clock and a
+	// divide-by-n counter. Frequency is independent of CPU clock speed.
+	// Must increment divider value by 2 (division ratio is always even).
+	// Minimum tested working value is 20 (corresponding to 24 MHz clock
+	// frequency) on DP5020B panel.
+	// Using value of 26 (corresponding to 18.462 MHz clock frequency) to improve
+	// stability and reduce glitching.
+	// Larger values may be more stable, but will decrease maximum refresh rate.
+	FlexIOClockDivider = 26
+
+	// Amount of time required to transfer 32 pixels.
+	// Adding 200 ns overhead time to improve stability.
+	MaxTransferNanos = (32*FlexIOClockDivider*1000)/480 + 200
+)
+
+func nanosToTicks(nano int64) uint32 { return uint32(nano / NanosPerTick) }
+
+// var rowDataBuffer [NumDMABufferRowBytes * NumRowBuffers / uint32(unsafe.Sizeof(uint32(0)))]uint32
 
 //go:section .dmabuffer
-var enablerSourceByte uint8
+//go:align 32
+var rowData [NumRowBuffers]rowPlane
+
+//go:section .dmabuffer
+var timerIdle timerControl
 
 //go:section .dmabuffer
 var timerLUT [hub75.LatchesPerRow]timerControl
 
-// unsigned int rowAddressBuffer[dmaBufferNumRows];
+//go:section .dmabuffer
+var enablerSourceByte volatile.Register8
 
-func NanosecondsToTicks(nano int64) uint32 {
-	return uint32(nano / NanosecondsPerTick)
-}
-
-// Padding added to the row data struct to ensure it is divided evenly by the
-// FlexIO buffer size plus extra padding for robustness.
-func PixelPad(panel hub75.Panel) uint32 {
-	return ((-panel.PixelsPerLatch())%ShifterPixels+ShifterPixels)%
-		ShifterPixels + ShifterPixels
-}
-
-func MinBlockPeriodNanoseconds(panel hub75.Panel) int64 {
-	return LatchDelayNanoseconds +
-		(MaxTransferNanoseconds*int64(PixelPad(panel)+panel.PixelsPerLatch()))/32
-}
-
-func MinBlockPeriodTicks(panel hub75.Panel) uint32 {
-	return NanosecondsToTicks(MinBlockPeriodNanoseconds(panel))
-}
-
-func TicksPerRow(panel hub75.Panel) uint32 {
-	return TimerFrequency / hub75.RefreshDepth / panel.ScanMod()
-}
-
-func MSBBlockTicks(panel hub75.Panel) uint32 {
-	return (TicksPerRow(panel) / 2) *
-		(1 << hub75.LatchesPerRow) / ((1 << hub75.LatchesPerRow) - 1)
-}
-
-func BufferBytesPerRow(panel hub75.Panel) uint32 {
-	return hub75.LatchesPerRow * panel.PixelsPerLatch() * 2 // 2 bytes per pixel
-}
+var (
+	fb  []frameBuffer
+	rb1 []rgb
+	rb2 []rgb
+)
 
 func (b *Board) Configure(matrix hub75.Matrix) error {
 
+	b.Panel = matrix.Panel
 	b.flex = FlexIOHandle
 
 	if err := b.Pins.Configure(b.flex, matrix.Pins); err != nil {
 		return err
 	}
+
+	b.ring.Init(uint32(len(rowData)))
+
+	timerIdle.per.Set(uint16(b.minBlockPeriodTicks()))
+	timerIdle.oen.Set(timerIdle.per.Get() + 1)
+	nxp.FlushDcache(uintptr(unsafe.Pointer(&timerIdle)), unsafe.Sizeof(timerIdle))
+
+	if err := b.updateTimerLookupTable(); err != nil {
+		return err
+	}
+
+	fb = make([]frameBuffer, 2)
+	for s := range fb {
+		fb[s] = make([][]rgb, b.height())
+		for y := range fb[s] {
+			fb[s][y] = make([]rgb, b.width())
+			for x := range fb[s][y] {
+				fb[s][y][x].R = 0xFFFF
+			}
+		}
+	}
+
+	rbLen := b.pixelsPerRefresh()
+	rb1 = make([]rgb, rbLen)
+	rb2 = make([]rgb, rbLen)
+
+	b.handleRowCalculation()
 
 	// Enable FlexIO peripheral
 	b.flex.CTRL.Set(nxp.FLEXIO_CTRL_FLEXEN | nxp.FLEXIO_CTRL_FASTACC)
@@ -243,7 +288,7 @@ func (b *Board) Configure(matrix hub75.Matrix) error {
 	//    pixel clock
 	//  - Upper 8 bits configure the number of pixel clock cycles to be generated
 	//    each time the shifters are reloaded
-	b.flex.TIMCMP[0].Set(((ShiftsPerReload*2 - 1) << 8) | (FlexIOClockDivider/2 - 1))
+	b.flex.TIMCMP[0].Set(((ShifterPixels*2 - 1) << 8) | (FlexIOClockDivider/2 - 1))
 
 	// Enable DMA trigger when data is loaded into the last data shifter so that
 	// reloading will occur automatically
@@ -257,8 +302,8 @@ func (b *Board) Configure(matrix hub75.Matrix) error {
 	pwm.MCTRL.SetBits((bit << nxp.PWM_MCTRL_CLDOK_Pos) & nxp.PWM_MCTRL_CLDOK_Msk)
 	pwm.SM[mod].CTRL.Set(nxp.PWM_SM0CTRL_FULL |
 		((LatchTimerPrescale << nxp.PWM_SM0CTRL_PRSC_Pos) & nxp.PWM_SM0CTRL_PRSC_Msk))
-	pwm.SM[mod].VAL1.Set(uint16(MinBlockPeriodTicks(matrix.Panel[0])))
-	pwm.SM[mod].VAL3.Set(uint16(MinBlockPeriodTicks(matrix.Panel[0])))
+	pwm.SM[mod].VAL1.Set(65535 - 1)
+	pwm.SM[mod].VAL3.Set(32767)
 	pwm.SM[mod].VAL5.Set(LatchPulseTicks)
 	pwm.OUTEN.SetBits((bit << nxp.PWM_OUTEN_PWMA_EN_Pos) & nxp.PWM_OUTEN_PWMA_EN_Msk)
 	pwm.OUTEN.SetBits((bit << nxp.PWM_OUTEN_PWMB_EN_Pos) & nxp.PWM_OUTEN_PWMB_EN_Msk)
@@ -281,35 +326,320 @@ func (b *Board) Configure(matrix hub75.Matrix) error {
 	b.dmaEnable.Enable(false)
 	b.dmaOutput.Enable(false)
 
-	const (
-		minor = unsafe.Sizeof(timerControl{})
-		major = uintptr(hub75.LatchesPerRow)
-	)
+	{
+		const (
+			minorBytes = unsafe.Sizeof(timerControl{})
+			majorIters = 1 // uintptr(hub75.LatchesPerRow)
 
-	srca := uintptr(unsafe.Pointer(&(timerLUT[0].oen)))
-	srco := unsafe.Sizeof(timerLUT[0].oen)
-	srcl := major * minor
-	dst1 := uintptr(unsafe.Pointer(&(pwm.SM[mod].VAL3)))
-	dst2 := uintptr(unsafe.Pointer(&(pwm.SM[mod].VAL1)))
-	dsto := dst2 - dst1
-	dstl := 2 * dsto
-	mino := dstl
+			srcOff  = unsafe.Sizeof(rowData[0].plane[0].timer.oen)
+			srcLast = unsafe.Sizeof(rowData[0].plane[0]) - minorBytes
+		)
 
-	b.dmaUpdate.TCD.SADDR.Set(uint32(srca))
-	b.dmaUpdate.TCD.SOFF.Set(uint16(srco))
-	b.dmaUpdate.TCD.ATTR.Set(0x0101) // 16-bit source, destination
-	b.dmaUpdate.TCD.NBYTES.Set((uint32(1) << 30) |
-		((uint32(mino) & 0xFFFFF) << 10) | (uint32(minor) & 0x3FF))
-	b.dmaUpdate.TCD.SLAST.Set(uint32(srcl))
-	b.dmaUpdate.TCD.DADDR.Set(uint32(dst1))
-	b.dmaUpdate.TCD.DOFF.Set(uint16(dsto))
-	b.dmaUpdate.TCD.DLAST.Set(uint32(dstl))
-	b.dmaUpdate.TCD.BITER.Set(uint16(major))
-	b.dmaUpdate.TCD.CITER.Set(uint16(major))
-	_, dmaTriggerPWMLAT := b.Pins.flex.LAT.DMAChannel()
-	b.dmaUpdate.SetHardwareTrigger(dmaTriggerPWMLAT)
+		srcAddr := uintptr(unsafe.Pointer(&(rowData[0].plane[0].timer.oen)))
+		dstAddr := uintptr(unsafe.Pointer(&(pwm.SM[mod].VAL3)))
+		dstOff := uintptr(unsafe.Pointer(&(pwm.SM[mod].VAL1))) - dstAddr
+		dstLast := negptr(2 * dstOff)
+		// minorOff := dstLast
+
+		b.dmaUpdate.TCD.SADDR.Set(uint32(srcAddr))
+		b.dmaUpdate.TCD.SOFF.Set(uint16(srcOff))
+		b.dmaUpdate.TCD.SLAST.Set(uint32(srcLast))
+		b.dmaUpdate.TCD.ATTR.Set( // 16-bit source (MSB) and destination (LSB)
+			(nxp.DMATransferSize2Bytes << 8) | nxp.DMATransferSize2Bytes)
+		b.dmaUpdate.TCD.NBYTES.Set(uint32(minorBytes))
+		b.dmaUpdate.TCD.DADDR.Set(uint32(dstAddr))
+		b.dmaUpdate.TCD.DOFF.Set(uint16(dstOff))
+		b.dmaUpdate.TCD.DLAST.Set(uint32(dstLast))
+		b.dmaUpdate.TCD.BITER.Set(uint16(majorIters))
+		b.dmaUpdate.TCD.CITER.Set(uint16(majorIters))
+		_, latTrigger := b.Pins.flex.LAT.DMAChannel()
+		b.dmaUpdate.SetHardwareTrigger(latTrigger)
+		b.dmaUpdate.SetInterruptOnSoftware(b.handleRowCalculation)
+		b.dmaUpdate.SetInterruptPriority(RowCalculationInterruptPriority)
+	}
+
+	{
+		enablerSourceByte.Set((uint8(b.dmaOutput.ID()) << nxp.DMA_SERQ_SERQ_Pos) &
+			nxp.DMA_SERQ_SERQ_Msk)
+		nxp.FlushDcache(uintptr(unsafe.Pointer(&enablerSourceByte)),
+			unsafe.Sizeof(enablerSourceByte))
+		b.dmaEnable.SetSource8(&(enablerSourceByte))
+		b.dmaEnable.SetDestination8(&(b.dmaEnable.SERQ))
+		b.dmaEnable.SetTransferCount(hub75.LatchesPerRow)
+		b.dmaEnable.SetTriggerOnCompletion(b.dmaUpdate.ID())
+	}
+
+	{
+		const (
+			minorIters = uintptr(DataShifters)
+			minorBytes = minorIters * unsafe.Sizeof(uint32(0))
+			majorBytes = unsafe.Sizeof(rowData[0].plane[0].px)
+			majorIters = majorBytes / minorBytes
+
+			srcOff  = unsafe.Sizeof(uint32(0))
+			srcLast = unsafe.Sizeof(rowData[0].plane[0]) - uintptr(majorBytes)
+			dstOff  = unsafe.Sizeof(uint32(0))
+		)
+
+		srcAddr := uintptr(unsafe.Pointer(&(rowData[0].plane[0].px[0])))
+
+		dstAddr := uintptr(unsafe.Pointer(&(b.flex.SHIFTBUF[0])))
+		dstLast := negptr(minorIters * dstOff)
+		minorOff := dstLast
+
+		b.dmaOutput.TCD.SADDR.Set(uint32(srcAddr))
+		b.dmaOutput.TCD.SOFF.Set(uint16(srcOff))
+		b.dmaOutput.TCD.SLAST.Set(uint32(srcLast))
+		b.dmaOutput.TCD.ATTR.Set( // 32-bit source (MSB) and destination (LSB)
+			(nxp.DMATransferSize4Bytes << 8) | nxp.DMATransferSize4Bytes)
+		b.dmaOutput.TCD.NBYTES.Set((uint32(1) << 30) |
+			((uint32(minorOff) & 0xFFFFF) << 10) | (uint32(minorBytes) & 0x3FF))
+		b.dmaOutput.TCD.DADDR.Set(uint32(dstAddr))
+		b.dmaOutput.TCD.DOFF.Set(uint16(dstOff))
+		b.dmaOutput.TCD.DLAST.Set(uint32(dstLast))
+		b.dmaOutput.TCD.BITER.Set(uint16(majorIters))
+		b.dmaOutput.TCD.CITER.Set(uint16(majorIters))
+		b.dmaOutput.SetDisableOnComplete(true)
+		b.dmaOutput.SetHardwareTrigger(b.flex.DMAChannel(DataShifters - 1))
+		b.dmaOutput.SetInterruptOnComplete(b.handleRowShiftComplete)
+		b.dmaOutput.SetInterruptPriority(RowShiftInterruptPriority)
+	}
+
+	b.dmaEnable.Enable(true)
+	b.dmaUpdate.Enable(true)
+
+	b.setRowAddress(b.ring.NextRead())
+
+	pwm.MCTRL.SetBits((bit << nxp.PWM_MCTRL_RUN_Pos) & nxp.PWM_MCTRL_RUN_Msk)
 
 	return nil
+}
+
+func (b *Board) updateTimerLookupTable() error {
+
+	const lpr = 1 << hub75.LatchesPerRow
+	tpr := b.ticksPerRow()
+	min := b.minBlockPeriodTicks()
+
+	if min*hub75.LatchesPerRow >= tpr {
+		return ErrMaxRefreshRate
+	}
+	if hub75.RefreshRateHz < b.minRefreshRateHz() {
+		return ErrMinRefreshRate
+	}
+
+	inc := tpr / 512
+	blk := tpr/2*lpr/(lpr-1) + inc
+
+	for {
+		blk -= inc
+		tik := uint32(0)
+		for i := 0; i < hub75.LatchesPerRow; i++ {
+			k := (blk >> (hub75.LatchesPerRow - i - 1)) + LatchPulseTicks
+			if k < min {
+				k = min
+			}
+			tik += k
+		}
+		if tik <= tpr {
+			break
+		}
+	}
+
+	for i := 0; i < hub75.LatchesPerRow; i++ {
+		k := uint32(blk) >> (hub75.LatchesPerRow - i - 1)
+		per := k + LatchPulseTicks
+		oen := k*b.dim/hub75.DimmingMaximum + LatchPulseTicks
+		if per < min {
+			d := min - per
+			per += d
+			oen += d
+		}
+		timerLUT[i].per.Set(uint16(per))
+		timerLUT[i].oen.Set(uint16(oen))
+	}
+	nxp.FlushDeleteDcache(
+		uintptr(unsafe.Pointer(&(timerLUT[0]))), unsafe.Sizeof(timerLUT))
+
+	return nil
+}
+
+func (b *Board) setRowAddress(row uint32) {
+	if int(row) < len(rowData) {
+		current := rowData[row].plane[0].address
+		address := uint32(0)
+		if (current & 0x01) != 0 {
+			address |= 1 << b.Pins.flex.A0.Pin
+		}
+		if (current & 0x02) != 0 {
+			address |= 1 << b.Pins.flex.A1.Pin
+		}
+		if (current & 0x04) != 0 {
+			address |= 1 << b.Pins.flex.A2.Pin
+		}
+		if (current & 0x08) != 0 {
+			address |= 1 << b.Pins.flex.A3.Pin
+		}
+		if (current & 0x10) != 0 {
+			address |= 1 << b.Pins.flex.A4.Pin
+		}
+		b.flex.SHIFTBUF[DataShifters].Set(address)
+	}
+}
+
+// handleRowShiftComplete runs at the completion of dmaOutput when a complete
+// bitplane has been output to the panel.
+//
+// If we have finished all the bitplanes for this row, it's time to update the
+// source address of dmaOutput to point to the next row in rowData.
+// Otherwise, the interrupt does nothing.
+//
+// To determine whether all the bitplanes are done, we look at dmaEnable, which
+// keeps an iteration count that corresponds to the bitplanes.
+//   - dmaEnable is serviced first each cycle, before handleRowShiftComplete.
+//   - On the last bitplane, CITER (current iteration) = 1.
+//   - When transaction finishes, CITER is reset to BITER (initial iteration).
+//   - So if CITER == BITER, that means the final bitplane was just completed.
+//     -- In this case it's time to update dmaOutput to the next row.
+func (b *Board) handleRowShiftComplete() {
+
+	b.dmaOutput.ClearInterrupt()
+
+	if b.dmaEnable.TCD.CITER.Get() == b.dmaEnable.TCD.BITER.Get() {
+		if b.ring.Read(); b.ring.Empty() {
+			// repeatedly load from values that set period to minBlockPeriodTicks and
+			// disable OE
+			b.dmaUpdate.TCD.SADDR.Set(uint32(uintptr(unsafe.Pointer(&timerIdle))))
+			// repeat idle timer
+			b.dmaUpdate.TCD.SLAST.Set(uint32(negptr(unsafe.Sizeof(timerIdle))))
+			// don't trigger dmaOutput until buffer is ready
+			b.dmaUpdate.TCD.CSR.ClearBits(nxp.DMA_TCD0_CSR_MAJORELINK)
+			b.underrun.Set(1)
+		} else {
+			row := b.ring.NextRead()
+			b.dmaOutput.TCD.SADDR.Set(
+				uint32(uintptr(unsafe.Pointer(&(rowData[row].plane[0].px[0])))))
+			b.dmaUpdate.TCD.SADDR.Set(
+				uint32(uintptr(unsafe.Pointer(&(rowData[row].plane[0].timer.oen)))))
+			b.setRowAddress(row)
+		}
+		b.dmaUpdate.SetInterruptPending(true)
+	}
+}
+
+// handleRowCalculation refills the row buffer.
+// It may be interrupted by handleRowShiftComplete.
+func (b *Board) handleRowCalculation() {
+	mod := b.scanMod()
+	for !b.ring.Full() {
+		row := b.current.Get()
+		b.loadBuffers(row)
+		b.writeBuffers()
+		if row += 1; row >= mod {
+			row = 0
+		}
+		b.current.Set(row)
+	}
+}
+
+func (b *Board) loadBuffers(row uint32) {
+
+	b.resetRowBuffer(rb1)
+	b.resetRowBuffer(rb2)
+
+	buf := &(rowData[b.ring.NextWrite()])
+
+	var y0, y1 uint32
+	for i := range b.Panel {
+		y0 = row + uint32(len(b.Panel)-i-1)*b.height()
+		y1 = y0 + b.scanMod()
+
+		dy := i * int(b.width())
+		for j := 0; j < int(b.width()); j++ {
+			rb1[dy+j] = fb[0][y0][j]
+			rb2[dy+j] = fb[0][y1][j]
+		}
+	}
+
+	for i := uint32(0); i < b.pixelsPerRefresh(); {
+		sz := b.width()
+		for k := uint32(0); k < sz; k++ {
+			pos := i + k
+			r0 := rb1[pos].R
+			g0 := rb1[pos].G
+			b0 := rb1[pos].B
+			r1 := rb2[pos].R
+			g1 := rb2[pos].G
+			b1 := rb2[pos].B
+
+			var data uint16
+			shl := 16 - hub75.ColorDepth
+			msk := uint16(1) << shl
+			for bit := 0; bit < hub75.LatchesPerRow; bit++ {
+				data = (r0 & msk) << b.Pins.flex.R0.Pin
+				data |= (g0 & msk) << b.Pins.flex.G0.Pin
+				data |= (b0 & msk) << b.Pins.flex.B0.Pin
+				data |= (r1 & msk) << b.Pins.flex.R1.Pin
+				data |= (g1 & msk) << b.Pins.flex.G1.Pin
+				data |= (b1 & msk) << b.Pins.flex.B1.Pin
+				data >>= shl
+				shl++
+				msk <<= 1
+				buf.plane[bit].px[pos] = data
+			}
+		}
+		i += sz
+	}
+	buf.plane[0].address = row
+}
+
+func (b *Board) writeBuffers() {
+	buf := &(rowData[b.ring.NextWrite()])
+	for i := 0; i < hub75.LatchesPerRow; i++ {
+		buf.plane[i].timer.per.Set(timerLUT[i].per.Get())
+		buf.plane[i].timer.oen.Set(timerLUT[i].oen.Get())
+	}
+	nxp.FlushDcache(uintptr(unsafe.Pointer(buf)), unsafe.Sizeof(*buf))
+	b.ring.Write()
+}
+
+func (b *Board) width() uint32 {
+	return b.Panel[0].Width()
+}
+
+func (b *Board) height() uint32 {
+	return b.Panel[0].Height()
+}
+
+func (b *Board) scanMod() uint32 {
+	return b.Panel[0].ScanMod()
+}
+
+func (b *Board) bytesPerRow() uint32 {
+	return b.Panel[0].BufferBytesPerRow()
+}
+
+func (b *Board) ticksPerRow() uint32 {
+	return b.Panel[0].TicksPerRow(TimerFrequencyHz)
+}
+
+func (b *Board) minBlockPeriodTicks() uint32 {
+	return nanosToTicks(LatchClockDelayNanos +
+		(MaxTransferNanos*int64(b.Panel[0].PixelsPerLatch()))/32)
+}
+
+func (b *Board) minRefreshRateHz() uint32 {
+	return b.Panel[0].MinRefreshRateHz(TimerFrequencyHz)
+}
+
+func (b *Board) pixelsPerRefresh() uint32 {
+	return b.Panel[0].PixelsPerLatch() / b.Panel[0].PhysicalRowsPerRefresh()
+}
+
+func (b *Board) resetRowBuffer(fb []rgb) {
+	for i := range fb {
+		fb[i].R, fb[i].G, fb[i].B = 0, 0, 0
+	}
 }
 
 func (p *Pins) Configure(bus *nxp.FlexIO, pins hub75.Pins) error {
@@ -410,3 +740,11 @@ func max(a, b nxp.FlexIOPin) nxp.FlexIOPin {
 	}
 	return b
 }
+
+// negptr returns an unsigned pointer value whose bit representation is exactly
+// equal to the negative of the given value (in two's complement notation).
+// For example, negptr(12345) = 4294954951 because both int32(-12345) and
+// uint32(4294954951) have the same 32-bit representation.
+// This routine is useful in situations where unsigned 32-bit data types are
+// required to hold signed 32-bit values, such as in memory-mapped registers.
+func negptr(x uintptr) uintptr { return ^x + 1 }

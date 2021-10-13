@@ -22,22 +22,22 @@ func (s *SmartMatrix) Configure() error {
 			},
 			Pins: hub75.Pins{
 				// Signal pins
-				OEN: machine.D2,
-				LAT: machine.D3,
-				CLK: machine.D7,
+				OEN: machine.HUB75_OEN_PIN,
+				LAT: machine.HUB75_LAT_PIN,
+				CLK: machine.HUB75_CLK_PIN,
 				// Data pins
-				R0: machine.D6,
-				G0: machine.D9,
-				B0: machine.D10,
-				R1: machine.D12,
-				G1: machine.D11,
-				B1: machine.D13,
+				R0: machine.HUB75_R0_PIN,
+				G0: machine.HUB75_G0_PIN,
+				B0: machine.HUB75_B0_PIN,
+				R1: machine.HUB75_R1_PIN,
+				G1: machine.HUB75_G1_PIN,
+				B1: machine.HUB75_B1_PIN,
 				// Address pins
-				A0: machine.D6,
-				A1: machine.D9,
-				A2: machine.D10,
-				A3: machine.D12,
-				A4: machine.D11,
+				A0: machine.HUB75_A0_PIN,
+				A1: machine.HUB75_A1_PIN,
+				A2: machine.HUB75_A2_PIN,
+				A3: machine.HUB75_A3_PIN,
+				A4: machine.HUB75_A4_PIN,
 			}}); err != nil {
 		return err
 	}

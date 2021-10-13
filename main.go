@@ -10,6 +10,8 @@ func main() {
 	if err := shield.SmartLED.Configure(); err != nil {
 		halt(err)
 	}
+	for {
+	}
 }
 
 func halt(err error) {

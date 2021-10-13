@@ -48,36 +48,49 @@ const (
 	Row16Col32Scan4v4
 )
 
+// Configuration constants for fine-tuning behavior of HUB75 panels.
 const (
-	DefaultPanelWidth = 32
+	DefaultPanelWidth = 64
 
-	RefreshDepth          = 24
+	RefreshRateHz = 240 // frames per second
+
+	ColorDepth            = 24 // bits
 	ParallelColorChannels = 2
 	ColorChannelsPerPixel = 3 // red, green, and blue
+
+	DimmingMaximum = 255
 
 	// LatchesPerRow computes the color depth per pixel for a given refresh depth.
 	// For example, LatchesPerRow=8 when RefreshDepth=24, which corresponds to
 	// 24-bit TrueColor (8 bits per pixel).
-	LatchesPerRow = RefreshDepth / ColorChannelsPerPixel
+	LatchesPerRow = ColorDepth / ColorChannelsPerPixel
 )
 
-// MinRefreshRate returns the minimum refresh rate of the receiver panel for a
+// MinRefreshRateHz returns the minimum refresh rate of the receiver panel for a
 // given timer frequency and refresh depth.
 // The HUB75 panel cannot refresh slower than this due to PWM register overflow.
-func (p Panel) MinRefreshRate(timerFreq uint32) uint32 {
+func (p Panel) MinRefreshRateHz(timerFreqHz uint32) uint32 {
 	lat := uint32(1) << LatchesPerRow
-	return ((timerFreq / 0xFFFF * lat / (lat - 1) / (p.ScanMod()) / 2) + 1)
+	return ((timerFreqHz / 0xFFFF * lat / (lat - 1) / (p.ScanMod()) / 2) + 1)
 }
 
-func (p Panel) MultiRowRefresh() bool {
-	return p.PhysicalRowsPerRefresh() > 1
+// func (p Panel) MultiRowRefresh() bool {
+// 	return p.PhysicalRowsPerRefresh() > 1
+// }
+
+func (p Panel) TicksPerRow(freqHz uint32) uint32 {
+	return freqHz / RefreshRateHz / p.ScanMod()
 }
 
-func (p Panel) PhysicalRowsPerRefresh() uint32 {
+func (p Panel) BufferBytesPerRow() uint32 { // default = 1024
+	return LatchesPerRow * p.PixelsPerLatch() * 2 // 2 bytes per pixel
+}
+
+func (p Panel) PhysicalRowsPerRefresh() uint32 { // default = 1
 	return p.Height() / p.ScanMod() / ParallelColorChannels
 }
 
-func (p Panel) PixelsPerLatch() uint32 {
+func (p Panel) PixelsPerLatch() uint32 { // default = 64
 	return p.PhysicalRowsPerRefresh() * p.Width()
 }
 
